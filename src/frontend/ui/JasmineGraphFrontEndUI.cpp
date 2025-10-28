@@ -43,6 +43,8 @@ limitations under the License.
 #include "../core/scheduler/JobScheduler.h"
 #include "../../partitioner/local/RDFParser.h"
 #include "../../util/kafka/StreamHandler.h"
+#include "../../util/hdfs/HDFSConnector.h"
+#include "../../util/hdfs/HDFSStreamHandler.h"
 #include "../JasmineGraphFrontEndProtocol.h"
 #include "antlr4-runtime.h"
 #include "/home/ubuntu/software/antlr/CypherLexer.h"
@@ -86,6 +88,9 @@ static void get_degree_command(int connFd, std::string command, int numberOfPart
 static void cypher_ast_command(int connFd, vector<DataPublisher *> &workerClients,
                                int numberOfPartitions, bool *loop_exit, std::string command);
 static void get_properties_command(int connFd, bool *loop_exit_p);
+static void addStreamHDFSCommand(std::string masterIP, int connFd, std::string &hdfsServerIp,
+                                 std::thread &inputStreamHandlerThread, int numberOfPartitions,
+                                 SQLiteDBInterface *sqlite, bool *loop_exit_p, std::string command);
 
 static vector<DataPublisher *> getWorkerClients(SQLiteDBInterface *sqlite) {
     const vector<Utils::worker> &workerList = Utils::getWorkerList(sqlite);
@@ -123,6 +128,8 @@ void *uifrontendservicesesion(void *dummyPt) {
     cppkafka::Configuration configs;
     KafkaConnector *kstream;
 
+    std::string hdfsServerIp;
+
     vector<DataPublisher *> workerClients;
     bool workerClientsInitialized = false;
 
@@ -157,6 +164,8 @@ void *uifrontendservicesesion(void *dummyPt) {
             list_command(connFd, sqlite, &loop_exit);
         } else if (token.compare(ADGR) == 0) {
             add_graph_command(masterIP, connFd, sqlite, &loop_exit, line);
+        } else if (token.compare(ADD_STREAM_HDFS) == 0) {
+            addStreamHDFSCommand(masterIP, connFd, hdfsServerIp, input_stream_handler, numberOfPartitions, sqlite, &loop_exit, line);
         } else if (token.compare(TRIANGLES) == 0) {
             triangles_command(masterIP, connFd, sqlite, perfSqlite, jobScheduler, &loop_exit, line);
         } else if (token.compare(RMGR) == 0) {
@@ -1000,4 +1009,113 @@ static void get_properties_command(int connFd, bool *loop_exit_p) {
         ui_frontend_logger.error("Error writing to socket");
         *loop_exit_p = true;
     }
+}
+
+void addStreamHDFSCommand(std::string masterIP, int connFd, std::string &hdfsServerIp,
+                             std::thread &inputStreamHandlerThread, int numberOfPartitions,
+                             SQLiteDBInterface *sqlite, bool *loop_exit_p, std::string command) {
+
+    try
+    {
+        ui_frontend_logger.info("Received HDFS stream command: " + command);
+
+        char delimiter = '|';
+        std::stringstream ss(command);
+        std::string token;
+        std::string useDefaultHdfs;
+
+
+        std::getline(ss, token, delimiter);
+        std::getline(ss, useDefaultHdfs, delimiter);
+
+        std::string hdfsPort;
+        std::string isEdgeList;
+        std::string isDirected;
+        std::string hdfsFilePath;
+
+        if (useDefaultHdfs == "y")
+        {
+            hdfsServerIp = Utils::getJasmineGraphProperty("org.jasminegraph.server.streaming.hdfs.host");
+            hdfsPort = Utils::getJasmineGraphProperty("org.jasminegraph.server.streaming.hdfs.port");
+            ui_frontend_logger.info("Using default HDFS: " + hdfsServerIp + ":" + hdfsPort);
+
+        }
+        else
+        {
+            std::getline(ss, hdfsServerIp, delimiter);
+            std::getline( ss, hdfsPort, delimiter);
+            ui_frontend_logger.info("Using custom HDFS: " + hdfsServerIp + ":" + hdfsPort);
+        }
+
+        std::getline(ss, isEdgeList, delimiter);
+        std::getline(ss, isDirected, delimiter);
+        std::getline(ss, hdfsFilePath, delimiter);
+
+        ui_frontend_logger.info("Validating HDFS path: " + hdfsFilePath);
+
+        HDFSConnector *hdfsConnector = new HDFSConnector(hdfsServerIp, hdfsPort);
+
+        if (!hdfsConnector->isPathValid(hdfsFilePath)) {
+            ui_frontend_logger.error("Invalid HDFS file path: " + hdfsFilePath);
+            std::string error_message = "The provided HDFS path is invalid.";
+            write(connFd, error_message.c_str(), error_message.length());
+            write(connFd, Conts::CARRIAGE_RETURN_NEW_LINE.c_str(), Conts::CARRIAGE_RETURN_NEW_LINE.size());
+            delete hdfsConnector;
+            *loop_exit_p = true;
+            return;
+        }
+
+        bool isEdgeListType = false;
+        if (isEdgeList == "y") {
+            isEdgeListType = true;
+        }
+
+        bool directed = false;
+        if (isDirected == "y") {
+            directed = true;
+        }
+
+        std::string path = "hdfs:" + hdfsFilePath;
+
+        std::time_t time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::string uploadStartTime = ctime(&time);
+        std::string sqlStatement =
+                "INSERT INTO graph (name, upload_path, upload_start_time, upload_end_time, graph_status_idgraph_status, "
+                "vertexcount, centralpartitioncount, edgecount, is_directed) VALUES(\"" +
+                hdfsFilePath + "\", \"" + path + "\", \"" + uploadStartTime + "\", \"\", \"" +
+                std::to_string(Conts::GRAPH_STATUS::NONOPERATIONAL) + "\", \"\", \"\", \"\", \"" +
+                (directed ? "TRUE" : "FALSE") + "\")";
+
+        int newGraphID = sqlite->runInsert(sqlStatement);
+        ui_frontend_logger.info("Created graph ID: " + std::to_string(newGraphID));
+        HDFSStreamHandler *streamHandler = new HDFSStreamHandler(hdfsConnector->getFileSystem(),
+                                                                 hdfsFilePath, numberOfPartitions,
+                                                                 newGraphID, sqlite, masterIP, directed, isEdgeListType);
+        ui_frontend_logger.info("Started listening to " + hdfsFilePath);
+        inputStreamHandlerThread = std::thread(&HDFSStreamHandler::startStreamingFromBufferToPartitions, streamHandler);
+        inputStreamHandlerThread.join();
+
+        std::string uploadEndTime = ctime(&time);
+        std::string sqlStatementUpdateEndTime =
+                "UPDATE graph "
+                "SET upload_end_time = \"" + uploadEndTime + "\" "
+                                                             "WHERE idgraph = " + std::to_string(newGraphID);
+        sqlite->runInsert(sqlStatementUpdateEndTime);
+        ui_frontend_logger.info("HDFS streaming completed for: " + hdfsFilePath);
+        delete streamHandler;
+        delete hdfsConnector;
+        int resultWr = write(connFd, DONE.c_str(), DONE.length());
+        if (resultWr < 0) {
+            ui_frontend_logger.error("Error writing DONE to socket");
+            *loop_exit_p = true;
+        }
+
+        write(connFd, Conts::CARRIAGE_RETURN_NEW_LINE.c_str(), Conts::CARRIAGE_RETURN_NEW_LINE.size());
+    }
+    catch (const std::exception &e)
+    {
+        ui_frontend_logger.error("Error in addStreamHDFSCommand: " + std::string(e.what()));
+        *loop_exit_p = true;
+    }
+
 }
